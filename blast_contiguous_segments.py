@@ -11,6 +11,15 @@ def get_subject_names(subject):
                 subject_ids.append(line[1:])
     return(subject_ids)
 
+def get_subject_names_DB(subject):
+    subject_ids = []
+    os.system(f'blastdbcmd -db {subject} -entry all -out sid.txt -outfmt "%t"')
+    with open("sid.txt",'r') as f:
+        for line in f:
+            line = line.strip()
+            subject_ids.append(line)
+    return(subject_ids)
+
 def join_continuous_blast_hits(sseq_table, surrounds):
     contiguous_hits_table = pd.DataFrame(columns=sseq_table.columns)
     sseq_table = sseq_table.sort_values(['ab_start']).reset_index(drop=True)
@@ -61,14 +70,39 @@ def join_continuous_blast_hits(sseq_table, surrounds):
                 ab_end = sseq_table.iloc[i,:]['ab_end']
     return(contiguous_hits_table)
 
-if len(sys.argv) != 7 :
-    sys.exit(f'Usage: {sys.argv[0]} [query <fasta>] [subject <fasta>] [output file name] join_gap[10000] hsp_qcov[70] p_ident[70]')
+def removeOverlapping(tab):
+    tab = tab.sort_values(['sseqid','srecid','ab_start'])
+    for i in range(len(tab)-1):
+        if (not tab['missing'].iloc[i]) and (not tab['missing'].iloc[i+1]):
+            if (tab['srecid'].iloc[i] == tab['srecid'].iloc[i+1]) & ((tab['ab_start'].iloc[i+1] in range(int(tab['ab_start'].iloc[i]),int(tab['ab_end'].iloc[i]))) | (tab['ab_start'].iloc[i] in range(int(tab['ab_start'].iloc[i+1]),int(tab['ab_end'].iloc[i+1]))) ):
+                if tab['ab_end'].iloc[i]-tab['ab_start'].iloc[i] < tab['ab_end'].iloc[i+1]-tab['ab_start'].iloc[i+1]:
+                    tab.iloc[i,2:] = ''
+                    tab['missing'].iloc[i] = True
+                else:
+                    tab.iloc[i+1,2:] = ''
+                    tab['missing'].iloc[i+1] = True
+    tab = tab.sort_values(['sseqid','qseqid'])
+    return(tab)
 
+if len(sys.argv) < 7 :
+    print('Missing arguments --> join_gap[10000] hsp_qcov[70] p_ident[70] are not optional.')
+    sys.exit(f'Usage: {sys.argv[0]} [query <fasta>] [subject <fasta>] [output file name] join_gap[10000] hsp_qcov[70] p_ident[70] [-db]')
+elif len(sys.argv) == 8 :
+    print('Using blast database. -db option')
+
+useBlastDB = False
 query = sys.argv[1]
 subject = sys.argv[2]
+
+if len(sys.argv) == 8 :
+    db = sys.argv[7]
+    if db == '-db':
+        print(f'DB: {subject}')
+        useBlastDB = True
+
 if (not os.path.exists(query)):
     sys.exit(f'{query} missing...')
-if (not os.path.exists(subject)):
+if (not os.path.exists(subject)) and (not useBlastDB):
     sys.exit(f'{subject} missing...')
 
 table_file = sys.argv[3]
@@ -77,14 +111,24 @@ table_file = sys.argv[3]
 surrounds = int(sys.argv[4])
 hsp_qcov = int(sys.argv[5])
 pident = int(sys.argv[6])
+
 #
-if not os.path.exists(table_file):
-    os.system(f'blastn -subject {subject} -query {query} -out {table_file} -outfmt "6 qseqid sseqid length qlen qstart qend slen sstart send evalue bitscore pident qcovs"')
+if (not os.path.exists(table_file)) and (not useBlastDB):
+    try:
+        os.system(f'blastn -task blastn -subject {subject} -query {query} -out {table_file} -perc_identity {pident} -evalue {0.001} -max_target_seqs 10000 -outfmt "6 qseqid sseqid length qlen qstart qend slen sstart send evalue bitscore pident qcovs"')
+    except:
+        print('Something went wrong, check your files.')
+elif (not os.path.exists(table_file)) and (useBlastDB):
+    try:
+        os.system(f'blastn -task blastn -db {subject} -query {query} -out {table_file} -perc_identity {pident} -evalue {0.001} -max_target_seqs 10000 -outfmt "6 qseqid sseqid length qlen qstart qend slen sstart send evalue bitscore pident qcovs" -num_threads 16')
+    except:
+        print('Something went wrong, check your files.')
 else:
     print(f'--> {table_file} exists, reading as previously run blast results...')
 
-#read table
+#read table. Blast trimms names in spaces....
 table = pd.read_table(table_file, names=['qseqid','sseqid','length','qlen','qstart','qend','slen','sstart','send','evalue','bitscore','pident','qcovs'])
+#table = table[table['evalue'] < 0.001]
 
 #format table
 table.loc[:,'hsp_qcov'] = [ ((row[5]-row[4])/row[3])*100 for _,row in table.iterrows()]
@@ -93,14 +137,19 @@ table.loc[:,'ab_end'] = [ row[8] if (row[7] < row[8]) else row[7] for _,row in t
 table.loc[:,'strand'] = [ '+' if (row[7] < row[8]) else '-' for _,row in table.iterrows()]
 
 #
-subject_ids = get_subject_names(subject)
+if not useBlastDB:
+    subject_ids = get_subject_names(subject)
+else:
+    subject_ids = get_subject_names_DB(subject)
+
 subject_ids = set([id.split('|')[0] for id in subject_ids])
-#
+ 
 continuous_blast_hits_table = pd.DataFrame()
 best_hits_per_query = pd.DataFrame()
 clusters = table.qseqid.unique()
 
 for cluster in clusters:
+    #
     c_continuous_blast_hits_table = pd.DataFrame()
     c_best_hits_per_subject = pd.DataFrame()
     clust_table = table[table['qseqid']== cluster]
@@ -139,7 +188,10 @@ for cluster in clusters:
         c_continuous_blast_hits_table.loc[i,'sseqid'] = missing_all_list[j]
         j += 1
     #best
-    c_best_hits_per_subject_unique.loc[:,'missing'] = 'False'
+    if len(c_best_hits_per_subject_unique) > 0:
+        c_best_hits_per_subject_unique.loc[:,'missing'] = 'False'
+    else:
+        c_best_hits_per_subject_unique = pd.DataFrame(columns=list(c_best_hits_per_subject.columns)+['missing'])
     j=0
     for i in range(len(c_best_hits_per_subject_unique),(len(c_best_hits_per_subject_unique) + len(missing_best_list))):
         c_best_hits_per_subject_unique.loc[i,'missing'] = 'True'
@@ -150,8 +202,12 @@ for cluster in clusters:
     continuous_blast_hits_table = pd.concat([continuous_blast_hits_table,c_continuous_blast_hits_table], ignore_index=True)
     best_hits_per_query = pd.concat([best_hits_per_query,c_best_hits_per_subject_unique], ignore_index=True)
 #
+
 unfiltered_continuous_blast_hits = os.path.join(os.path.split(table_file)[0],'unfiltered_continuous_blast_hits.csv')
 continuous_blast_hits_table.to_csv(unfiltered_continuous_blast_hits)
+
+#analyze overlapping clusters
+best_hits_per_query = removeOverlapping(best_hits_per_query)
 
 filtered_continuous_blast_hits_qc = os.path.join(os.path.split(table_file)[0],f'filtered_continuous_blast_hits_qc{hsp_qcov}_pid{pident}.csv')
 best_hits_per_query.to_csv(filtered_continuous_blast_hits_qc)
